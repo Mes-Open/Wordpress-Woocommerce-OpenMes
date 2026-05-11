@@ -11,26 +11,40 @@ if (!defined('ABSPATH')) {
 
 final class OpenMES_Order_Handler
 {
+    private const ORDER_WO_SENT_META = '_openmes_work_orders_created';
+
     /** @var int[] Product IDs that already had a WO created via order hook in this request */
     private array $order_wo_created_for = [];
 
     public function register(): void
     {
-        add_action('woocommerce_checkout_order_processed', [$this, 'on_order_processed'], 20, 1);
-        add_action('woocommerce_store_api_checkout_order_processed', [$this, 'on_order_processed'], 20, 1);
+        // Fire only after payment is confirmed — `processing` for paid online orders,
+        // `completed` to cover digital products that skip straight past `processing`.
+        add_action('woocommerce_order_status_processing', [$this, 'on_order_paid'], 20, 2);
+        add_action('woocommerce_order_status_completed', [$this, 'on_order_paid'], 20, 2);
         add_action('woocommerce_product_set_stock', [$this, 'on_product_stock_changed'], 20, 1);
         add_action('woocommerce_variation_set_stock', [$this, 'on_product_stock_changed'], 20, 1);
     }
 
-    public function on_order_processed($order): void
+    /**
+     * @param int           $order_id
+     * @param WC_Order|null $order
+     */
+    public function on_order_paid($order_id, $order = null): void
     {
         try {
             if (!$this->is_enabled()) {
                 return;
             }
 
-            $order = $order instanceof WC_Order ? $order : wc_get_order($order);
+            $order = $order instanceof WC_Order ? $order : wc_get_order($order_id);
             if (!$order instanceof WC_Order) {
+                return;
+            }
+
+            // Idempotency: an order can transition processing → completed (and back),
+            // firing this hook multiple times. Only send work orders on the first pass.
+            if ($order->get_meta(self::ORDER_WO_SENT_META) === 'yes') {
                 return;
             }
 
@@ -60,8 +74,11 @@ final class OpenMES_Order_Handler
                     $this->order_wo_created_for[] = $product_id;
                 }
             }
+
+            $order->update_meta_data(self::ORDER_WO_SENT_META, 'yes');
+            $order->save();
         } catch (\Throwable $e) {
-            OpenMES_Logger::error('Error in on_order_processed: ' . $e->getMessage());
+            OpenMES_Logger::error('Error in on_order_paid: ' . $e->getMessage());
         }
     }
 
@@ -79,8 +96,10 @@ final class OpenMES_Order_Handler
                 return;
             }
 
+            // Trigger only on the transition to exactly zero. Already-negative stock
+            // would otherwise fire a fresh restock WO on every subsequent decrement.
             $stock = $product->get_stock_quantity();
-            if ($stock === null || (int) $stock > 0) {
+            if ($stock === null || (int) $stock !== 0) {
                 return;
             }
 
@@ -110,30 +129,27 @@ final class OpenMES_Order_Handler
                 return;
             }
 
-            $line_id     = OpenMES_Product_Fields::resolve_line_id($base_id);
-            $stock_int   = (int) $stock;
-            $planned_qty = $stock_int < 0 ? (float) abs($stock_int) : 1.0;
-            $variation   = $product->is_type('variation') ? '-' . $product_id : '';
-            $order_no    = 'WC-RESTOCK-' . $base_id . $variation
+            $line_id   = OpenMES_Product_Fields::resolve_line_id($base_id);
+            $variation = $product->is_type('variation') ? '-' . $product_id : '';
+            $order_no  = 'WC-RESTOCK-' . $base_id . $variation
                 . '-' . bin2hex(random_bytes(4));
 
             $payload = [
                 'order_no'    => $order_no,
-                'planned_qty' => $planned_qty,
+                'planned_qty' => 1.0,
                 'description' => sprintf(
-                    /* translators: 1: product name, 2: current stock */
-                    __('Auto restock — product out of stock: %1$s (stock: %2$d)', 'openmes-connector'),
-                    $product->get_name(),
-                    $stock_int
+                    /* translators: %s: product name */
+                    __('Auto restock — product out of stock: %s', 'openmes-connector'),
+                    $product->get_name()
                 ),
                 'extra_data'  => [
-                    'source'             => 'woocommerce',
-                    'trigger'            => 'out_of_stock',
-                    'wc_product_id'      => $product_id,
-                    'wc_parent_id'       => $base_id,
-                    'wc_product_name'    => $product->get_name(),
-                    'wc_product_sku'     => $product->get_sku(),
-                    'wc_stock_quantity'  => $stock_int,
+                    'source'            => 'woocommerce',
+                    'trigger'           => 'out_of_stock',
+                    'wc_product_id'     => $product_id,
+                    'wc_parent_id'      => $base_id,
+                    'wc_product_name'   => $product->get_name(),
+                    'wc_product_sku'    => $product->get_sku(),
+                    'wc_stock_quantity' => 0,
                 ],
             ];
 

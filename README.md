@@ -10,8 +10,8 @@ A WordPress/WooCommerce plugin that automatically creates **work orders** in [Op
 
 - Flag any product as *"Manufacture in OpenMES"* directly from the WooCommerce product edit page
 - Assign products to specific production lines (or use a global default)
-- On order checkout, a work order is automatically created in OpenMES via API
-- Auto-restock work orders when stock drops to 0 for backorder-enabled manufactured products
+- Once the order's payment is confirmed (status moves to `processing` or `completed`), a work order is automatically created in OpenMES via API
+- Auto-restock work orders when stock drops to exactly 0 for backorder-enabled manufactured products
 - Full order metadata (order number, product name, customer ID) stored in `extra_data`
 - All API calls logged via WooCommerce's logger (**WooCommerce → Status → Logs**, source `openmes-connector`)
 - HPOS (High-Performance Order Storage) compatible
@@ -66,7 +66,7 @@ Or zip the `openmes-connector/` directory and upload via **Plugins → Add New �
 Customer places order
         │
         ▼
-woocommerce_checkout_order_processed fires
+Payment is confirmed — order status becomes `processing` (or `completed`)
         │
         ▼
 For each line item → is "manufacture" flag set?
@@ -81,7 +81,9 @@ For each line item → is "manufacture" flag set?
         }
 ```
 
-When stock for a manufactured product drops to 0 (and backorders are allowed), a separate `WC-RESTOCK-…` work order is created.
+Work orders are created at most once per order (idempotency flag is stored on the order as `_openmes_work_orders_created`), so transitions like `processing → completed` won't duplicate them.
+
+When stock for a manufactured product drops to exactly 0 (and backorders are allowed), a separate `WC-RESTOCK-…` work order is created. Subsequent decrements into negative stock do not re-trigger.
 
 ---
 
